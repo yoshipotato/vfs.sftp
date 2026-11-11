@@ -1,5 +1,23 @@
 # VFS SFTP addon for Kodi
 
+## Fork changes (WinINET host + reconnects)
+
+- **Host from the Windows proxy setting.** On desktop Windows the add-on reads the
+  WinINET proxy (Settings > Network > Proxy, "Use a proxy server") and connects to that
+  host instead of the one in the Kodi source. Port, user and password still come from
+  the source. With no proxy enabled (or on other platforms) the source's host is used.
+  A changed proxy IP is picked up on the next request.
+- **Connect retries.** 3 attempts per connect, 5 s timeout each, 1 s then 2 s between
+  them. Wrong credentials or a changed host key are not retried.
+- **Auto-reconnect.** A dropped or dead session is reconnected on the next request
+  (after a failed connect it fails fast for 5 s so Kodi doesn't hang). Every operation
+  is retried once after a reconnect, and open files are reopened at the same position,
+  so playback can continue after a short network drop.
+- **Operation timeout.** 15 s for blocking SFTP operations once connected.
+
+The values are constants at the top of `src/SFTPSession.cpp`.
+
+
 This is a [Kodi](https://kodi.tv) VFS addon to support SFTP file systems.
 
 [![License: GPL-2.0-or-later](https://img.shields.io/badge/License-GPL%20v2+-blue.svg)](LICENSE.md)

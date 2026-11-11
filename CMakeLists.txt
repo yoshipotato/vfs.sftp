@@ -13,9 +13,11 @@ include_directories(${KODI_INCLUDE_DIR}/..
                     ${SSH_INCLUDE_DIRS})
 
 set(SFTP_SOURCES src/SFTPSession.cpp
-                 src/SFTPFile.cpp)
+                 src/SFTPFile.cpp
+                 src/WinINetProxy.cpp)
 
-set(SFTP_HEADERS src/SFTPSession.h)
+set(SFTP_HEADERS src/SFTPSession.h
+                 src/WinINetProxy.h)
 
 set(DEPLIBS ${SSH_LIBRARIES}
             OpenSSL::SSL
@@ -28,6 +30,11 @@ add_definitions( -D_LARGEFILE64_SOURCE -D_FILE_OFFSET_BITS=64)
 if(CORE_SYSTEM_NAME MATCHES "windows")
   list(APPEND DEPLIBS iphlpapi.lib WS2_32.lib crypt32.lib)
   add_definitions(-D_CRT_NONSTDC_NO_DEPRECATE -DLIBSSH_STATIC)
+endif()
+
+# WinINET is only available on desktop Windows (not UWP / Windows Store)
+if(CORE_SYSTEM_NAME STREQUAL "windows")
+  list(APPEND DEPLIBS wininet.lib)
 endif()
 
 build_addon(vfs.sftp SFTP DEPLIBS)
