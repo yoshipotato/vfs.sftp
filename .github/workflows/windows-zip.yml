@@ -8,8 +8,8 @@ on:
 env:
   app_id: vfs.sftp
   # Kodi branch whose add-on build system and dependencies are used.
-  # Matches this add-on's branch (Piers = Kodi 22).
-  kodi_ref: Piers
+  # Must match this add-on's branch: Omega = Kodi 21.
+  kodi_ref: Omega
 
 jobs:
   windows:
