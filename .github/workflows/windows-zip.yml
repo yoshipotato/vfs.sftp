@@ -4,12 +4,19 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      kodi_ref:
+        description: "Kodi branch or tag to build against (e.g. 21.0-Omega, 21.2-Omega)"
+        required: false
+        default: "21.0-Omega"
 
 env:
   app_id: vfs.sftp
-  # Kodi branch whose add-on build system and dependencies are used.
-  # Must match this add-on's branch: Omega = Kodi 21.
-  kodi_ref: Omega
+  # Kodi version whose add-on headers and dependencies are used. Build against the
+  # OLDEST Kodi release you run: the add-on declares the API versions it was built
+  # with, and older Kodi builds reject (Kodi 21.0 even crashes on) newer ones.
+  # The Omega branch head needs kodi.binary.global.filesystem 1.1.9; 21.0/21.1 have 1.1.8.
+  kodi_ref: ${{ inputs.kodi_ref || '21.0-Omega' }}
 
 jobs:
   windows:
