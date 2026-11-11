@@ -1,0 +1,101 @@
+name: Windows add-on zip
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  app_id: vfs.sftp
+  # Kodi branch whose add-on build system and dependencies are used.
+  # Matches this add-on's branch (Piers = Kodi 22).
+  kodi_ref: Piers
+
+jobs:
+  windows:
+    name: Windows ${{ matrix.arch }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, Win32]
+
+    steps:
+      - name: Checkout Kodi repo
+        uses: actions/checkout@v5
+        with:
+          repository: xbmc/xbmc
+          ref: ${{ env.kodi_ref }}
+          path: kodi
+
+      - name: Checkout add-on repo
+        uses: actions/checkout@v5
+        with:
+          path: ${{ env.app_id }}
+
+      - name: Prepare add-on definition
+        shell: pwsh
+        run: |
+          $ws = "${{ github.workspace }}" -replace '\\', '/'
+          $def = "$ws/definition/${{ env.app_id }}"
+          New-Item -ItemType Directory -Force -Path $def | Out-Null
+          Set-Content -Path "$def/${{ env.app_id }}.txt" -Value "${{ env.app_id }} $ws/${{ env.app_id }}" -NoNewline
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          $ws = "${{ github.workspace }}" -replace '\\', '/'
+          cmake -G "Visual Studio 17 2022" -A ${{ matrix.arch }} -T host=x64 `
+            -B build `
+            -DADDONS_TO_BUILD=${{ env.app_id }} `
+            -DADDON_SRC_PREFIX="$ws" `
+            -DADDONS_DEFINITION_DIR="$ws/definition" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_INSTALL_PREFIX="$ws/install" `
+            -DPACKAGE_ZIP=1 `
+            "$ws/kodi/cmake/addons"
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release --target ${{ env.app_id }}
+
+      - name: Package zip
+        id: package
+        shell: pwsh
+        run: |
+          $id = "${{ env.app_id }}"
+          # Find the built add-on folder: the one holding both the DLL and the generated addon.xml
+          $dll = Get-ChildItem -Path "${{ github.workspace }}" -Recurse -Filter "$id.dll" -ErrorAction SilentlyContinue |
+                 Where-Object { Test-Path (Join-Path $_.DirectoryName 'addon.xml') } |
+                 Select-Object -First 1
+          if (-not $dll) {
+            Write-Host "Built add-on not found. DLLs in the workspace:"
+            Get-ChildItem -Path "${{ github.workspace }}" -Recurse -Filter "*.dll" -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -notmatch '\\kodi\\' } | ForEach-Object { $_.FullName }
+            exit 1
+          }
+          $src = $dll.DirectoryName
+          Write-Host "Add-on folder: $src"
+
+          [xml]$xml = Get-Content (Join-Path $src 'addon.xml')
+          $version = $xml.addon.version
+
+          # Kodi expects the zip to contain a single top-level folder named after the add-on id
+          $stage = Join-Path "${{ runner.temp }}" 'stage'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item -Recurse -Path $src -Destination (Join-Path $stage $id)
+
+          $zipName = "$id-$version-windows-${{ matrix.arch }}.zip"
+          $zip = Join-Path "${{ github.workspace }}" $zipName
+          Compress-Archive -Path (Join-Path $stage $id) -DestinationPath $zip -Force
+          Get-ChildItem -Recurse (Join-Path $stage $id) | ForEach-Object { $_.FullName.Substring($stage.Length + 1) }
+
+          "zip=$zipName" >> $env:GITHUB_OUTPUT
+          "name=$id-$version-windows-${{ matrix.arch }}" >> $env:GITHUB_OUTPUT
+
+      - name: Upload zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: ${{ steps.package.outputs.zip }}
+          if-no-files-found: error
