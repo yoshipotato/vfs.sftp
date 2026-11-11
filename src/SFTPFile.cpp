@@ -27,8 +27,11 @@ class ATTR_DLL_LOCAL CSFTPFile : public kodi::addon::CInstanceVFS
   struct SFTPContext
   {
     CSFTPSessionPtr session;
-    sftp_file sftp_handle;
+    sftp_file sftp_handle = nullptr;
     std::string file;
+    mode_t mode = O_RDONLY;
+    unsigned int generation = 0; // connection the handle belongs to
+    int64_t position = 0; // tracked here so the file can be reopened after a reconnect
   };
 
 public:
@@ -42,54 +45,96 @@ public:
   ssize_t Read(kodi::addon::VFSFileHandle context, uint8_t* buffer, size_t uiBufSize) override
   {
     SFTPContext* ctx = static_cast<SFTPContext*>(context);
-    if (ctx && ctx->session && ctx->sftp_handle)
+    if (!ctx || !ctx->session)
     {
-      int rc = ctx->session->Read(ctx->sftp_handle, buffer, uiBufSize);
-
-      if (rc >= 0)
-        return rc;
-      else
-        kodi::Log(ADDON_LOG_ERROR, "SFTPFile: Failed to read %s", ctx->file.c_str());
-    }
-    else
       kodi::Log(ADDON_LOG_ERROR, "SFTPFile: Can't read without a handle");
+      return -1;
+    }
 
+    // One normal try, plus one more after reconnecting if the connection dropped.
+    for (int attempt = 0; attempt < 2; ++attempt)
+    {
+      if (!EnsureHandle(ctx))
+        break;
+
+      int rc = ctx->session->Read(ctx->sftp_handle, buffer, uiBufSize);
+      if (rc >= 0)
+      {
+        ctx->position += rc;
+        return rc;
+      }
+
+      if (attempt == 0 && ctx->session->IsConnectionError())
+      {
+        kodi::Log(ADDON_LOG_WARNING, "SFTPFile: Connection lost reading '%s' at %lld, retrying",
+                  ctx->file.c_str(), static_cast<long long>(ctx->position));
+        ctx->session->Reconnect();
+        continue;
+      }
+      break;
+    }
+
+    kodi::Log(ADDON_LOG_ERROR, "SFTPFile: Failed to read %s", ctx->file.c_str());
     return -1;
   }
 
   ssize_t Write(kodi::addon::VFSFileHandle context, const uint8_t* buffer, size_t uiBufSize) override
   {
     SFTPContext* ctx = static_cast<SFTPContext*>(context);
-    if (ctx && ctx->session && ctx->sftp_handle)
+    if (!ctx || !ctx->session)
     {
-      int writeBytes = ctx->session->Write(ctx->sftp_handle, buffer, uiBufSize);
-
-      if (writeBytes >= 0)
-        return writeBytes;
-      else
-        kodi::Log(ADDON_LOG_ERROR, "SFTPFile: Failed to write %s", ctx->file.c_str());
-    }
-    else
       kodi::Log(ADDON_LOG_ERROR, "SFTPFile: Can't write without a handle");
+      return -1;
+    }
 
+    for (int attempt = 0; attempt < 2; ++attempt)
+    {
+      if (!EnsureHandle(ctx))
+        break;
+
+      int writeBytes = ctx->session->Write(ctx->sftp_handle, buffer, uiBufSize);
+      if (writeBytes >= 0)
+      {
+        ctx->position += writeBytes;
+        return writeBytes;
+      }
+
+      if (attempt == 0 && ctx->session->IsConnectionError())
+      {
+        kodi::Log(ADDON_LOG_WARNING, "SFTPFile: Connection lost writing '%s', retrying",
+                  ctx->file.c_str());
+        ctx->session->Reconnect();
+        continue;
+      }
+      break;
+    }
+
+    kodi::Log(ADDON_LOG_ERROR, "SFTPFile: Failed to write %s", ctx->file.c_str());
     return -1;
   }
 
   int64_t Seek(kodi::addon::VFSFileHandle context, int64_t iFilePosition, int whence) override
   {
     SFTPContext* ctx = static_cast<SFTPContext*>(context);
-    if (ctx && ctx->session && ctx->sftp_handle)
+    if (ctx && ctx->session && EnsureHandle(ctx))
     {
-      uint64_t position = 0;
+      int64_t position = 0;
       if (whence == SEEK_SET)
         position = iFilePosition;
       else if (whence == SEEK_CUR)
-        position = GetPosition(context) + iFilePosition;
+        position = ctx->position + iFilePosition;
       else if (whence == SEEK_END)
         position = GetLength(context) + iFilePosition;
 
-      if (ctx->session->Seek(ctx->sftp_handle, position) == 0)
-        return GetPosition(context);
+      if (position < 0)
+        return -1;
+
+      // sftp_seek64 only moves the local offset, it doesn't talk to the server
+      if (ctx->session->Seek(ctx->sftp_handle, static_cast<uint64_t>(position)) == 0)
+      {
+        ctx->position = position;
+        return position;
+      }
       else
         return -1;
     }
@@ -113,8 +158,8 @@ public:
   int64_t GetPosition(kodi::addon::VFSFileHandle context) override
   {
     SFTPContext* ctx = static_cast<SFTPContext*>(context);
-    if (ctx->session && ctx->sftp_handle)
-      return ctx->session->GetPosition(ctx->sftp_handle);
+    if (ctx && ctx->session)
+      return ctx->position;
 
     kodi::Log(ADDON_LOG_ERROR, "SFTPFile: Can't get position without a handle for '%s'",
               ctx->file.c_str());
@@ -140,7 +185,7 @@ public:
   {
     SFTPContext* ctx = static_cast<SFTPContext*>(context);
     if (ctx->session && ctx->sftp_handle)
-      ctx->session->CloseFileHandle(ctx->sftp_handle);
+      ctx->session->CloseFileHandle(ctx->sftp_handle, ctx->generation);
     delete ctx;
 
     return true;
@@ -267,6 +312,37 @@ public:
   bool IoControlSetRetry (kodi::addon::VFSFileHandle context, bool retry) override { return false; }
 
 private:
+  //! Makes sure ctx->sftp_handle belongs to the current connection, reopening the
+  //! file at the saved position after a reconnect.
+  bool EnsureHandle(SFTPContext* ctx)
+  {
+    if (ctx->sftp_handle && ctx->generation == ctx->session->Generation())
+      return true;
+
+    // The old handle belonged to a freed SFTP session; it can't be closed safely.
+    ctx->sftp_handle = nullptr;
+
+    // Never truncate when reopening a file we were already writing.
+    mode_t mode = ctx->mode & ~O_TRUNC;
+    unsigned int generation = 0;
+    sftp_file handle = ctx->session->CreateFileHande(ctx->file, mode, &generation);
+    if (!handle)
+      return false;
+
+    if (ctx->position > 0 &&
+        ctx->session->Seek(handle, static_cast<uint64_t>(ctx->position)) != 0)
+    {
+      ctx->session->CloseFileHandle(handle, generation);
+      return false;
+    }
+
+    ctx->sftp_handle = handle;
+    ctx->generation = generation;
+    kodi::Log(ADDON_LOG_INFO, "SFTPFile: Reopened '%s' at %lld after reconnect",
+              ctx->file.c_str(), static_cast<long long>(ctx->position));
+    return true;
+  }
+
   kodi::addon::VFSFileHandle OpenInternal(const kodi::addon::VFSUrl& url, mode_t mode)
   {
     SFTPContext* result = new SFTPContext;
@@ -276,7 +352,9 @@ private:
     if (result->session)
     {
       result->file = url.GetFilename().c_str();
-      result->sftp_handle = result->session->CreateFileHande(result->file, mode);
+      result->mode = mode;
+      result->sftp_handle =
+          result->session->CreateFileHande(result->file, mode, &result->generation);
       if (result->sftp_handle)
         return result;
     }

@@ -6,14 +6,21 @@
  */
 
 #include "SFTPSession.h"
+#include "WinINetProxy.h"
 
 #include <fcntl.h>
+#include <thread>
 #include <kodi/General.h>
 #include <sstream>
 #include <sys/stat.h>
 #include <sys/types.h>
 
-#define SFTP_TIMEOUT 10
+// Timeouts and retries
+static constexpr long SFTP_CONNECT_TIMEOUT_SEC = 5; // per connection attempt
+static constexpr long SFTP_IO_TIMEOUT_SEC = 15; // blocking SFTP operations once connected
+static constexpr int SFTP_CONNECT_ATTEMPTS = 3; // connection attempts before giving up
+static constexpr int SFTP_RETRY_BASE_DELAY_MS = 1000; // delay between attempts, doubles each time
+static constexpr int SFTP_RECONNECT_COOLDOWN_SEC = 5; // after a failed connect, fail fast for this long
 #ifndef S_ISREG
 #define S_ISREG(m) ((m & _S_IFREG) != 0)
 #endif
@@ -82,13 +89,16 @@ static const char* SFTPErrorText(int sftp_error)
   return "Unknown error code";
 }
 
-CSFTPSession::CSFTPSession(const kodi::addon::VFSUrl& url)
+CSFTPSession::CSFTPSession(const kodi::addon::VFSUrl& url, const std::string& host)
+  : m_host(host),
+    m_port(url.GetPort() != 0 ? url.GetPort() : 22),
+    m_username(url.GetUsername()),
+    m_password(url.GetPassword())
 {
-  kodi::Log(ADDON_LOG_INFO, "SFTPSession: Creating new session on host '%s:%d' with user '%s'",
-            url.GetHostname().c_str(), url.GetPort(), url.GetUsername().c_str());
+  kodi::Log(ADDON_LOG_INFO, "SFTPSession: Creating new session on host '%s:%u' with user '%s'",
+            m_host.c_str(), m_port, m_username.c_str());
   std::unique_lock<std::recursive_mutex> lock(m_lock);
-  if (!Connect(url))
-    Disconnect();
+  Connect();
 
   m_LastActive = std::chrono::high_resolution_clock::now();
 }
@@ -99,16 +109,27 @@ CSFTPSession::~CSFTPSession()
   Disconnect();
 }
 
-sftp_file CSFTPSession::CreateFileHande(const std::string& file, mode_t mode)
+sftp_file CSFTPSession::CreateFileHande(const std::string& file,
+                                        mode_t mode,
+                                        unsigned int* generation)
 {
-  if (m_connected)
+  if (EnsureConnected())
   {
     std::unique_lock<std::recursive_mutex> lock(m_lock);
     m_LastActive = std::chrono::high_resolution_clock::now();
     sftp_file handle = sftp_open(m_sftp_session, CorrectPath(file).c_str(), mode, S_IRUSR | S_IWUSR);
+    if (!handle && IsConnectionError())
+    {
+      kodi::Log(ADDON_LOG_WARNING, "SFTPSession: Connection lost opening '%s', reconnecting",
+                file.c_str());
+      if (Reconnect())
+        handle = sftp_open(m_sftp_session, CorrectPath(file).c_str(), mode, S_IRUSR | S_IWUSR);
+    }
     if (handle)
     {
       sftp_file_set_blocking(handle);
+      if (generation)
+        *generation = m_generation;
       return handle;
     }
     else
@@ -122,17 +143,48 @@ sftp_file CSFTPSession::CreateFileHande(const std::string& file, mode_t mode)
   return nullptr;
 }
 
-void CSFTPSession::CloseFileHandle(sftp_file handle)
+void CSFTPSession::CloseFileHandle(sftp_file handle, unsigned int generation)
 {
   std::unique_lock<std::recursive_mutex> lock(m_lock);
-  sftp_close(handle);
+  // A handle from an earlier connection points at an SFTP session that has
+  // already been freed, so it must not be touched.
+  if (handle && generation == m_generation && m_sftp_session)
+    sftp_close(handle);
 }
 
 bool CSFTPSession::GetDirectory(const std::string& base,
                                 const std::string& folder,
                                 std::vector<kodi::vfs::CDirEntry>& items)
 {
+  if (!EnsureConnected())
+  {
+    kodi::Log(ADDON_LOG_ERROR, "SFTPSession: Not connected, can't list directory '%s'",
+              folder.c_str());
+    return false;
+  }
+
+  bool connectionError = false;
+  if (GetDirectoryOnce(base, folder, items, connectionError))
+    return true;
+
+  if (connectionError)
+  {
+    kodi::Log(ADDON_LOG_WARNING, "SFTPSession: Connection lost listing '%s', reconnecting",
+              folder.c_str());
+    if (Reconnect())
+      return GetDirectoryOnce(base, folder, items, connectionError);
+  }
+
+  return false;
+}
+
+bool CSFTPSession::GetDirectoryOnce(const std::string& base,
+                                    const std::string& folder,
+                                    std::vector<kodi::vfs::CDirEntry>& items,
+                                    bool& connectionError)
+{
   int sftp_error = SSH_FX_OK;
+  connectionError = false;
   if (m_connected)
   {
     sftp_dir dir = nullptr;
@@ -143,7 +195,10 @@ bool CSFTPSession::GetDirectory(const std::string& base,
 
     //Doing as little work as possible within the critical section
     if (!dir)
+    {
       sftp_error = sftp_get_error(m_sftp_session);
+      connectionError = IsConnectionError();
+    }
 
     lock.unlock();
 
@@ -247,13 +302,29 @@ bool CSFTPSession::FileExists(const std::string& path)
   return exists && S_ISREG(permissions);
 }
 
+sftp_attributes CSFTPSession::StatAttributes(const std::string& path)
+{
+  if (!EnsureConnected())
+    return nullptr;
+
+  std::unique_lock<std::recursive_mutex> lock(m_lock);
+  m_LastActive = std::chrono::high_resolution_clock::now();
+  sftp_attributes attributes = sftp_stat(m_sftp_session, CorrectPath(path).c_str());
+  if (!attributes && IsConnectionError())
+  {
+    kodi::Log(ADDON_LOG_WARNING, "SFTPSession: Connection lost reading '%s', reconnecting",
+              path.c_str());
+    if (Reconnect())
+      attributes = sftp_stat(m_sftp_session, CorrectPath(path).c_str());
+  }
+  return attributes;
+}
+
 int CSFTPSession::Stat(const std::string& path, kodi::vfs::FileStatus& buffer)
 {
-  if (m_connected)
+  if (EnsureConnected())
   {
-    std::unique_lock<std::recursive_mutex> lock(m_lock);
-    m_LastActive = std::chrono::high_resolution_clock::now();
-    sftp_attributes attributes = sftp_stat(m_sftp_session, CorrectPath(path).c_str());
+    sftp_attributes attributes = StatAttributes(path);
 
     if (attributes)
     {
@@ -326,34 +397,25 @@ bool CSFTPSession::IsIdle()
 
 bool CSFTPSession::DeleteFile(const std::string& path)
 {
-  std::unique_lock<std::recursive_mutex> lock(m_lock);
-  m_LastActive = std::chrono::high_resolution_clock::now();
-  int result = sftp_unlink(m_sftp_session, CorrectPath(path).c_str());
-  return result == 0 ? true : false;
+  return RunWithRetry([&]() { return sftp_unlink(m_sftp_session, CorrectPath(path).c_str()); });
 }
 
 bool CSFTPSession::DeleteDirectory(const std::string& path)
 {
-  std::unique_lock<std::recursive_mutex> lock(m_lock);
-  m_LastActive = std::chrono::high_resolution_clock::now();
-  int result = sftp_rmdir(m_sftp_session, CorrectPath(path).c_str());
-  return result == 0 ? true : false;
+  return RunWithRetry([&]() { return sftp_rmdir(m_sftp_session, CorrectPath(path).c_str()); });
 }
 
 bool CSFTPSession::MakeDirectory(const std::string& path)
 {
-  std::unique_lock<std::recursive_mutex> lock(m_lock);
-  m_LastActive = std::chrono::high_resolution_clock::now();
-  int result = sftp_mkdir(m_sftp_session, CorrectPath(path).c_str(), S_IRWXU);
-  return result == 0 ? true : false;
+  return RunWithRetry([&]() { return sftp_mkdir(m_sftp_session, CorrectPath(path).c_str(), S_IRWXU); });
 }
 
 bool CSFTPSession::RenameFile(const std::string& path_from, const std::string& path_to)
 {
-  std::unique_lock<std::recursive_mutex> lock(m_lock);
-  m_LastActive = std::chrono::high_resolution_clock::now();
-  int result = sftp_rename(m_sftp_session, CorrectPath(path_from).c_str(), CorrectPath(path_to).c_str());
-  return result == 0 ? true : false;
+  return RunWithRetry([&]() {
+    return sftp_rename(m_sftp_session, CorrectPath(path_from).c_str(),
+                       CorrectPath(path_to).c_str());
+  });
 }
 
 bool CSFTPSession::VerifyKnownHost(ssh_session session)
@@ -423,44 +485,75 @@ bool CSFTPSession::VerifyKnownHost(ssh_session session)
   return false;
 }
 
-bool CSFTPSession::Connect(const kodi::addon::VFSUrl& url)
+bool CSFTPSession::Connect()
 {
-  int timeout = SFTP_TIMEOUT;
+  int delayMs = SFTP_RETRY_BASE_DELAY_MS;
+  for (int attempt = 1; attempt <= SFTP_CONNECT_ATTEMPTS; ++attempt)
+  {
+    ConnectResult result = ConnectOnce();
+    if (result == ConnectResult::OK)
+    {
+      if (attempt > 1)
+        kodi::Log(ADDON_LOG_INFO, "SFTPSession: Connected to '%s:%u' on attempt %d",
+                  m_host.c_str(), m_port, attempt);
+      return true;
+    }
+
+    Disconnect();
+
+    if (result == ConnectResult::FATAL)
+      break;
+
+    if (attempt < SFTP_CONNECT_ATTEMPTS)
+    {
+      kodi::Log(ADDON_LOG_WARNING,
+                "SFTPSession: Connection attempt %d/%d to '%s:%u' failed, retrying in %d ms",
+                attempt, SFTP_CONNECT_ATTEMPTS, m_host.c_str(), m_port, delayMs);
+      std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+      delayMs *= 2;
+    }
+  }
+
+  kodi::Log(ADDON_LOG_ERROR, "SFTPSession: Giving up connecting to '%s:%u'", m_host.c_str(),
+            m_port);
+  m_lastConnectAttempt = std::chrono::steady_clock::now();
+  return false;
+}
+
+CSFTPSession::ConnectResult CSFTPSession::ConnectOnce()
+{
+  long timeout = SFTP_CONNECT_TIMEOUT_SEC;
+  unsigned int port = m_port;
   m_connected = false;
   m_session = nullptr;
   m_sftp_session = nullptr;
-
-  // Check if url contains port, else fallback to 22 (default)
-  unsigned int port = url.GetPort();
-  if (port == 0)
-    port = 22;
 
   m_session = ssh_new();
   if (m_session == nullptr)
   {
     kodi::Log(ADDON_LOG_ERROR, "SFTPSession: Failed to initialize session for host '%s'",
-              url.GetHostname().c_str());
-    return false;
+              m_host.c_str());
+    return ConnectResult::FATAL;
   }
 
-  if (ssh_options_set(m_session, SSH_OPTIONS_USER, url.GetUsername().c_str()) < 0)
+  if (ssh_options_set(m_session, SSH_OPTIONS_USER, m_username.c_str()) < 0)
   {
     kodi::Log(ADDON_LOG_ERROR, "SFTPSession: Failed to set username '%s' for session",
-              url.GetUsername().c_str());
-    return false;
+              m_username.c_str());
+    return ConnectResult::FATAL;
   }
 
-  if (ssh_options_set(m_session, SSH_OPTIONS_HOST, url.GetHostname().c_str()) < 0)
+  if (ssh_options_set(m_session, SSH_OPTIONS_HOST, m_host.c_str()) < 0)
   {
     kodi::Log(ADDON_LOG_ERROR, "SFTPSession: Failed to set host '%s' for session",
-              url.GetHostname().c_str());
-    return false;
+              m_host.c_str());
+    return ConnectResult::FATAL;
   }
 
   if (ssh_options_set(m_session, SSH_OPTIONS_PORT, &port) < 0)
   {
-    kodi::Log(ADDON_LOG_ERROR, "SFTPSession: Failed to set port '%d' for session", port);
-    return false;
+    kodi::Log(ADDON_LOG_ERROR, "SFTPSession: Failed to set port '%u' for session", port);
+    return ConnectResult::FATAL;
   }
 
 #if defined(TARGET_DARWIN_IOS) || defined(TARGET_WINDOWS_STORE)
@@ -469,23 +562,24 @@ bool CSFTPSession::Connect(const kodi::addon::VFSUrl& url)
   {
     kodi::Log(ADDON_LOG_ERROR, "SFTPSession: Failed to set .ssh folder to '%s' for session",
               sshFolder.c_str());
-    return false;
+    return ConnectResult::FATAL;
   }
 #endif
 
-  ssh_options_set(m_session, SSH_OPTIONS_LOG_VERBOSITY, 0);
+  int verbosity = SSH_LOG_NOLOG;
+  ssh_options_set(m_session, SSH_OPTIONS_LOG_VERBOSITY, &verbosity);
   ssh_options_set(m_session, SSH_OPTIONS_TIMEOUT, &timeout);
 
   if (ssh_connect(m_session))
   {
     kodi::Log(ADDON_LOG_ERROR, "SFTPSession: Failed to connect '%s'", ssh_get_error(m_session));
-    return false;
+    return ConnectResult::RETRY;
   }
 
   if (!VerifyKnownHost(m_session))
   {
     kodi::Log(ADDON_LOG_ERROR, "SFTPSession: Host is not known '%s'", ssh_get_error(m_session));
-    return false;
+    return ConnectResult::FATAL;
   }
 
   int noAuth = SSH_AUTH_DENIED;
@@ -493,7 +587,7 @@ bool CSFTPSession::Connect(const kodi::addon::VFSUrl& url)
   {
     kodi::Log(ADDON_LOG_ERROR, "SFTPSession: Failed to authenticate via guest '%s'",
               ssh_get_error(m_session));
-    return false;
+    return ConnectResult::RETRY;
   }
 
   int method = ssh_userauth_list(m_session, nullptr);
@@ -505,7 +599,7 @@ bool CSFTPSession::Connect(const kodi::addon::VFSUrl& url)
   {
     kodi::Log(ADDON_LOG_ERROR, "SFTPSession: Failed to authenticate via publickey '%s'",
               ssh_get_error(m_session));
-    return false;
+    return ConnectResult::RETRY;
   }
 
   // Try to authenticate with password
@@ -513,15 +607,15 @@ bool CSFTPSession::Connect(const kodi::addon::VFSUrl& url)
   if (method & SSH_AUTH_METHOD_PASSWORD)
   {
     if (publicKeyAuth != SSH_AUTH_SUCCESS &&
-        (passwordAuth = ssh_userauth_password(m_session, url.GetUsername().c_str(),
-                                              url.GetPassword().c_str())) == SSH_AUTH_ERROR)
+        (passwordAuth = ssh_userauth_password(m_session, m_username.c_str(),
+                                              m_password.c_str())) == SSH_AUTH_ERROR)
     {
       kodi::Log(ADDON_LOG_ERROR, "SFTPSession: Failed to authenticate via password '%s'",
                 ssh_get_error(m_session));
-      return false;
+      return ConnectResult::RETRY;
     }
   }
-  else if (!url.GetPassword().empty())
+  else if (!m_password.empty())
   {
     kodi::Log(ADDON_LOG_ERROR,
               "SFTPSession: Password present, but server does not support password authentication");
@@ -536,30 +630,38 @@ bool CSFTPSession::Connect(const kodi::addon::VFSUrl& url)
     {
       kodi::Log(ADDON_LOG_ERROR, "SFTPSession: Failed to initialize channel '%s'",
                 ssh_get_error(m_session));
-      return false;
+      return ConnectResult::RETRY;
     }
 
     if (sftp_init(m_sftp_session))
     {
       kodi::Log(ADDON_LOG_ERROR, "SFTPSession: Failed to initialize sftp '%s'",
                 ssh_get_error(m_session));
-      return false;
+      return ConnectResult::RETRY;
     }
 
+    // Longer timeout for normal operations than for the initial connect
+    long ioTimeout = SFTP_IO_TIMEOUT_SEC;
+    ssh_options_set(m_session, SSH_OPTIONS_TIMEOUT, &ioTimeout);
+
     m_connected = true;
-  }
-  else
-  {
-    kodi::Log(ADDON_LOG_ERROR, "SFTPSession: No authentication method successful");
+    m_generation++;
+    return ConnectResult::OK;
   }
 
-  return m_connected;
+  // Wrong user/password or key: retrying won't help.
+  kodi::Log(ADDON_LOG_ERROR, "SFTPSession: No authentication method successful");
+  return ConnectResult::FATAL;
 }
 
 void CSFTPSession::Disconnect()
 {
   if (m_sftp_session)
+  {
     sftp_free(m_sftp_session);
+    // Any open file handles belonged to the freed SFTP session.
+    m_generation++;
+  }
 
   if (m_session)
   {
@@ -569,6 +671,68 @@ void CSFTPSession::Disconnect()
 
   m_sftp_session = nullptr;
   m_session = nullptr;
+  m_connected = false;
+}
+
+bool CSFTPSession::EnsureConnected()
+{
+  std::unique_lock<std::recursive_mutex> lock(m_lock);
+  if (m_connected && m_session && ssh_is_connected(m_session))
+    return true;
+
+  // Don't block every Kodi request on a server that just failed to answer.
+  auto sinceLastFailure = std::chrono::steady_clock::now() - m_lastConnectAttempt;
+  if (sinceLastFailure < std::chrono::seconds(SFTP_RECONNECT_COOLDOWN_SEC))
+    return false;
+
+  if (m_session)
+    kodi::Log(ADDON_LOG_WARNING, "SFTPSession: Connection to '%s:%u' was lost, reconnecting",
+              m_host.c_str(), m_port);
+  Disconnect();
+  return Connect();
+}
+
+bool CSFTPSession::Reconnect()
+{
+  std::unique_lock<std::recursive_mutex> lock(m_lock);
+  Disconnect();
+  return EnsureConnected();
+}
+
+bool CSFTPSession::IsConnectionError()
+{
+  std::unique_lock<std::recursive_mutex> lock(m_lock);
+  if (!m_connected || !m_session || !ssh_is_connected(m_session))
+    return true;
+
+  if (ssh_get_error_code(m_session) == SSH_FATAL)
+    return true;
+
+  if (m_sftp_session)
+  {
+    int error = sftp_get_error(m_sftp_session);
+    if (error == SSH_FX_CONNECTION_LOST || error == SSH_FX_NO_CONNECTION)
+      return true;
+  }
+
+  return false;
+}
+
+bool CSFTPSession::RunWithRetry(const std::function<int()>& op)
+{
+  if (!EnsureConnected())
+    return false;
+
+  std::unique_lock<std::recursive_mutex> lock(m_lock);
+  m_LastActive = std::chrono::high_resolution_clock::now();
+  int result = op();
+  if (result != 0 && IsConnectionError())
+  {
+    kodi::Log(ADDON_LOG_WARNING, "SFTPSession: Connection lost, reconnecting and retrying");
+    if (Reconnect())
+      result = op();
+  }
+  return result == 0;
 }
 
 /*!
@@ -581,19 +745,16 @@ bool CSFTPSession::GetItemPermissions(const std::string& path, uint32_t& permiss
 {
   bool gotPermissions = false;
   std::unique_lock<std::recursive_mutex> lock(m_lock);
-  if (m_connected)
+  sftp_attributes attributes = StatAttributes(path);
+  if (attributes)
   {
-    sftp_attributes attributes = sftp_stat(m_sftp_session, CorrectPath(path).c_str());
-    if (attributes)
+    if (attributes->flags & SSH_FILEXFER_ATTR_PERMISSIONS)
     {
-      if (attributes->flags & SSH_FILEXFER_ATTR_PERMISSIONS)
-      {
-        permissions = attributes->permissions;
-        gotPermissions = true;
-      }
-
-      sftp_attributes_free(attributes);
+      permissions = attributes->permissions;
+      gotPermissions = true;
     }
+
+    sftp_attributes_free(attributes);
   }
   return gotPermissions;
 }
@@ -612,14 +773,29 @@ CSFTPSessionPtr CSFTPSessionManager::CreateSession(const kodi::addon::VFSUrl& ur
   if (port == 0)
     port = 22;
 
+  // Connect to the host of the Windows (WinINET) proxy when one is enabled,
+  // otherwise to the host in the URL. Looked up on every request so a changed
+  // proxy IP gets a new session.
+  std::string host = GetWinINetProxyHost();
+  if (host.empty())
+    host = url.GetHostname();
+
   std::unique_lock<std::recursive_mutex> lock(m_lock);
-  std::string key = url.GetUsername() + ":" + url.GetPassword() + "@" + url.GetHostname() + ":" +
+  std::string key = url.GetUsername() + ":" + url.GetPassword() + "@" + host + ":" +
                     std::to_string(port);
   CSFTPSessionPtr ptr = sessions[key];
   if (ptr == nullptr)
   {
-    ptr = CSFTPSessionPtr(new CSFTPSession(url));
+    if (host != url.GetHostname())
+      kodi::Log(ADDON_LOG_INFO, "SFTPSession: Using WinINET proxy host '%s' instead of '%s'",
+                host.c_str(), url.GetHostname().c_str());
+    ptr = CSFTPSessionPtr(new CSFTPSession(url, host));
     sessions[key] = ptr;
+  }
+  else
+  {
+    // A cached session that failed or dropped gets another chance (rate limited).
+    ptr->EnsureConnected();
   }
 
   return ptr;
