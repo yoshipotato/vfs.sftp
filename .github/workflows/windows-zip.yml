@@ -80,22 +80,20 @@ jobs:
           [xml]$xml = Get-Content (Join-Path $src 'addon.xml')
           $version = $xml.addon.version
 
-          # Kodi expects the zip to contain a single top-level folder named after the add-on id
+          # Kodi expects the zip to contain a single top-level folder named after the add-on id.
+          # GitHub zips the artifact on download, so uploading this staging folder makes the
+          # downloaded file itself the installable add-on zip (no zip inside a zip).
           $stage = Join-Path "${{ runner.temp }}" 'stage'
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item -Recurse -Path $src -Destination (Join-Path $stage $id)
-
-          $zipName = "$id-$version-windows-${{ matrix.arch }}.zip"
-          $zip = Join-Path "${{ github.workspace }}" $zipName
-          Compress-Archive -Path (Join-Path $stage $id) -DestinationPath $zip -Force
           Get-ChildItem -Recurse (Join-Path $stage $id) | ForEach-Object { $_.FullName.Substring($stage.Length + 1) }
 
-          "zip=$zipName" >> $env:GITHUB_OUTPUT
+          "stage=$stage" >> $env:GITHUB_OUTPUT
           "name=$id-$version-windows-${{ matrix.arch }}" >> $env:GITHUB_OUTPUT
 
-      - name: Upload zip
+      - name: Upload add-on zip
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.package.outputs.name }}
-          path: ${{ steps.package.outputs.zip }}
+          path: ${{ steps.package.outputs.stage }}
           if-no-files-found: error
